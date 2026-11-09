@@ -30,6 +30,11 @@ def main(argv: list[str] | None = None) -> int:
     
     p_stats = sub.add_parser("stats", help="Show store statistics as JSON.")
 
+    p_compact = sub.add_parser(
+        "compact",
+        help="Merge old segments, keeping only live records.",
+    )
+
     args = parser.parse_args(argv)
 
     with Bitcask(args.dir) as db:
@@ -50,6 +55,10 @@ def main(argv: list[str] | None = None) -> int:
 
         elif args.command == "stats":
             print(json.dumps(db.stats()))
+
+        elif args.command == "compact":
+            result = db.compact()
+            print(json.dumps(result))
 
     return 1
 

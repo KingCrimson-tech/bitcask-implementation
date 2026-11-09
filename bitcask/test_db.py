@@ -100,3 +100,47 @@ def test_stats_counts(tmp_path):
     db.delete("k1")
     assert db.stats()["keys"] == 1
     db.close()
+
+def test_compaction_reclaims(tmp_path):
+    db = Bitcask(tmp_path, segment_size=1024)
+
+    # 1,000 overwrites over 10 keys — disk explodes, keys stay 10
+    for i in range(1000):
+        for j in range(10):
+            db.put(f"key_{j}", f"value-{i}")
+
+    keys_before = db.stats()["keys"]
+    disk_before = db.stats()["disk_bytes"]
+
+    result = db.compact()
+
+    disk_after = db.stats()["disk_bytes"]
+    assert keys_before == 10
+    # All live data still readable — last write is value-999
+    for j in range(10):
+        assert db.get(f"key_{j}") == "value-999"
+
+    # Disk shrank >80%
+    assert disk_after < disk_before * 0.2, f"{disk_after} !< 0.2 * {disk_before}"
+    assert result["segments_merged"] >= 1
+    assert result["bytes_reclaimed"] > 0
+    db.close()
+
+    # Restart-after-compact still readable
+    db2 = Bitcask(tmp_path)
+    for j in range(10):
+        assert db2.get(f"key_{j}") == "value-999"
+    db2.close()
+
+
+def test_compaction_preserves_live_keys(tmp_path):
+    db = Bitcask(tmp_path)
+    db.put("a", "1")
+    db.put("b", "2")
+    db.delete("b")          # tombstone — b must NOT come back
+    db.put("a", "3")        # overwrite — a=1 is dead
+    db.compact()
+    assert db.get("a") == "3"
+    with pytest.raises(KeyError):
+        db.get("b")
+    db.close()

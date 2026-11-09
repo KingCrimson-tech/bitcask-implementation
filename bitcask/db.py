@@ -156,6 +156,86 @@ class Bitcask:
                 "data_dir": str(self.data_dir),
             }
 
+    def compact(self) -> dict:
+        with self._lock:  # hold for whole merge (v1: simple + safe)
+            if not self._segments:
+                return {"segments_merged": 0, "bytes_reclaimed": 0}
+    
+            segments_merged = 0
+            before = sum(p.stat().st_size for p in self._segments.values() if p.exists())
+    
+            # Snapshot: decisions are made against this copy,
+            # mutations go to the live dict
+            live_snapshot = dict(self._keydir)
+    
+            for seg_id in sorted(self._segments):
+                if seg_id == self._active_id:
+                    continue  # never compact the active segment
+                old_path = self._segments[seg_id]
+                if not old_path.exists():
+                    continue
+    
+                tmp_path = old_path.with_suffix(".tmp")  # seg_000001.tmp
+                tmp_writer = SegmentWriter(tmp_path, seg_id)  # reuse append/fsync logic
+    
+                for offset, ts, key_bytes, value in iter_records(old_path):
+                    key = key_bytes.decode("utf-8")
+                    loc = live_snapshot.get(key)
+                    # Only rewrite if this EXACT record is what's live now.
+                    # Tombstones (value is None) are never live — skip.
+                    if value is None or loc is None:
+                        continue
+                    live_seg, live_off, _, _ = loc
+                    if live_seg == seg_id and live_off == offset:
+                        # Re-encode with original ts? Use original record bytes via encode_record.
+                        # Prefer re-encoding to avoid double-encoding bugs; keep ts.
+                        new_record = encode_record(ts, key_bytes, value)
+                        new_offset = tmp_writer.append(new_record)
+                        self._keydir[key] = (seg_id, new_offset, len(value), ts)
+    
+                tmp_writer.close()
+    
+                # fsync temp before rename (SegmentWriter already fsyncs per append,
+                # but do a final explicit fsync of the file + directory)
+                try:
+                    fd = os.open(tmp_path, os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    pass
+    
+                # Atomic replacement: tmp → old_path (same segment id)
+                os.replace(tmp_path, old_path)
+                # fsync directory so rename is durable (best effort)
+                self._fsync_dir(self.segments_dir)
+    
+                segments_merged += 1
+                if old_path.exists() and old_path.stat().st_size == 0:
+                    # No live records — drop the segment entirely
+                    old_path.unlink()
+                    del self._segments[seg_id]
+    
+            after = sum(p.stat().st_size for p in self._segments.values() if p.exists())
+            reclaimed = max(0, before - after)
+            return {"segments_merged": segments_merged, "bytes_reclaimed": reclaimed}
+    
+        # --- helpers (add alongside compact) ---
+    
+    def _fsync_dir(self, path: Path) -> None:
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass  # best-effort on platforms that don't support it
+    
+    def _segment_has_live(self, seg_id: int, snapshot: dict) -> bool:
+            return any(loc[0] == seg_id for loc in snapshot.values())
+
 def _seg_id_of(path: Path) -> int:
     # seg_000001.log -> 1
     return int(path.stem.split("_", 1)[1])
