@@ -2,6 +2,7 @@ plan.md
 TUTORIAL.md
 docs/
 data/
+benchmark-data
 
 __pycache__/
 *.pyc
