@@ -84,7 +84,7 @@ class Bitcask:
     def _rotate(self) -> None:
         self._active.close()
         self._active_id += 1
-        path = self._segments_dir / f"seg_{self._active_id:06d}.log"
+        path = self.segments_dir / f"seg_{self._active_id:06d}.log"
         self._segments[self._active_id] = path
         self._active = SegmentWriter(path, self._active_id)
 
