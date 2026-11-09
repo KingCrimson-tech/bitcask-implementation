@@ -82,3 +82,37 @@ class SegmentWriter:
     def close(self) -> None:
         if not self._file.closed:
             self._file.close()
+
+def iter_records(path: Path):
+    """
+    Yield (offset, ts, key: bytes, value: bytes | None) per record.
+    Stop at first truncated / CRC-mismatched record. Never raise
+    for corruption — caller handles truncation.
+    """
+    offset = 0
+    with open(path, "rb") as f:
+        while True:
+            start = f.tell()
+            header = f.read(HEADER.size)
+            if len(header) < HEADER.size:
+                return  # EOF or torn header — clean stop
+            try:
+                magic, ts, key_len, val_len, crc = HEADER.unpack(header)
+                if magic != MAGIC:
+                    return
+                payload = f.read(key_len + val_len)
+                if len(payload) < key_len + val_len:
+                    return  # torn payload
+                key = payload[:key_len]
+                value = payload[key_len:key_len + val_len] if val_len else None
+                header_without_crc = HEADER_WITHOUT_CRC.pack(
+                    magic, ts, key_len, val_len
+                )
+                expected = zlib.crc32(header_without_crc + key + (value or b"")) & 0xFFFFFFFF
+                if expected != crc:
+                    return  # stop: do not yield this record
+            except struct.error:
+                return
+            offset = f.tell()
+            yield (start, ts, key, value)
+            # loop continues; last_good_offset is start + HEADER.size + key_len + val_len

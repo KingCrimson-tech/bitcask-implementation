@@ -1,24 +1,35 @@
 import threading
 import time
 from pathlib import Path
+import os
+import sys
 
-from bitcask.log import SegmentWriter, encode_record, decode_record, HEADER, MAGIC
+from bitcask.log import SegmentWriter, encode_record, decode_record, HEADER, MAGIC, iter_records
 
 
 class Bitcask:
     def __init__(self, data_dir: str | Path, segment_size: int = 2 * 1024 * 1024):
-        self._lock = threading.RLock()
-        self._data_dir = Path(data_dir)
-        self._segments_dir = self._data_dir / "segments"
-        self._segments_dir.mkdir(parents=True, exist_ok=True)
-
-        self._segment_size = segment_size
-        self._keydir: dict[str, tuple[int, int, int, int]] = {}
-        self._segments: dict[int, Path] = {}
-
-        self._active_id = 1
-        self._segments[1] = self._segments_dir / "seg_000001.log"
-        self._active = SegmentWriter(self._segments[1], self._active_id)
+            self.data_dir = Path(data_dir)
+            self.segments_dir = self.data_dir / "segments"
+            self.segments_dir.mkdir(parents=True, exist_ok=True)
+            self.segment_size = segment_size
+            self._lock = threading.RLock()
+            self._keydir: dict[str, tuple[int, int, int, int]] = {}
+            self._segments: dict[int, Path] = {}
+    
+            # Discover existing segments, sorted NUMERICALLY (not lexically)
+            for path in sorted(self.segments_dir.glob("seg_*.log"), key=_seg_id_of):
+                seg_id = _seg_id_of(path)
+                self._segments[seg_id] = path
+    
+            self._replay()
+    
+            # Always open a NEW active segment after replay.
+            # Do NOT append to a replayed tail — it may have been truncated.
+            self._active_id = (max(self._segments) + 1) if self._segments else 1
+            active_path = self._segment_path(self._active_id)
+            self._segments[self._active_id] = active_path
+            self._active = SegmentWriter(active_path, self._active_id)
 
     def put(self, key: str, value: str) -> None:
         with self._lock:
@@ -28,13 +39,20 @@ class Bitcask:
 
             record = encode_record(ts, key_bytes, value_bytes)
 
-            # Durable append FIRST, index update SECOND (see §4.2).
-            offset = self._active.append(record)
-            self._keydir[key] = (self._active_id, offset, len(value_bytes), ts)
-
-            # Rotate AFTER the write that crossed the limit.
-            if self._active.tell() > self._segment_size:
+            # Rotate BEFORE writing if the record won't fit.
+            if (
+                self._active.tell() > 0
+                and self._active.tell() + len(record) > self.segment_size
+            ):
                 self._rotate()
+
+            offset = self._active.append(record)
+            self._keydir[key] = (
+                self._active_id,
+                offset,
+                len(value_bytes),
+                ts
+            )
 
     def get(self, key: str) -> str:
         with self._lock:
@@ -79,3 +97,35 @@ class Bitcask:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+    def _segment_path(self, seg_id: int) -> Path:
+            return self.segments_dir / f"seg_{seg_id:06d}.log"
+
+    def _replay(self) -> None:
+            replayed_keys: set[str] = set()
+            for seg_id in sorted(self._segments):  # oldest → newest
+                path = self._segments[seg_id]
+                last_good = 0
+                for offset, ts, key_bytes, value in iter_records(path):
+                    key = key_bytes.decode("utf-8")
+                    if value is None:
+                        self._keydir.pop(key, None)  # tombstone (Ch.7; harmless now)
+                    else:
+                        self._keydir[key] = (seg_id, offset, len(value), ts)
+                    replayed_keys.add(key)
+                    last_good = offset + HEADER.size + len(key_bytes) + (len(value) if value else 0)
+                # Truncate torn tail if present, never crash
+                try:
+                    size = path.stat().st_size
+                    if last_good < size:
+                        os.truncate(path, last_good)
+                        print(
+                            f"replayed {len(self._segments)} segments, {len(self._keydir)} keys, truncated {size - last_good} bytes from {path.name}",
+                            file=sys.stderr,
+                        )
+                except FileNotFoundError:
+                    pass
+
+def _seg_id_of(path: Path) -> int:
+    # seg_000001.log -> 1
+    return int(path.stem.split("_", 1)[1])
