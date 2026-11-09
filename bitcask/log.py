@@ -1,6 +1,8 @@
 # bitcask/log.py
 import struct
 import zlib
+import os
+from pathlib import Path
 
 MAGIC = b"BITC"
 HEADER = struct.Struct(">4sQIII")             # 24 bytes: magic, ts, key_len, val_len, crc
@@ -49,3 +51,34 @@ def decode_record(buf: bytes) -> tuple[int, bytes, bytes | None, int]:
 
     value = None if val_len == 0 else value_bytes
     return ts, key, value, record_len
+
+class SegmentWriter:
+    """Append-only writer for one segment file.
+
+    Every record is written, flushed, and fsynced before append() returns,
+    so a returned write survives process kill and power loss.
+    """
+
+    def __init__(self, path: Path, segment_id: int):
+        self.path = Path(path)
+        self.segment_id = segment_id
+        self._file = open(self.path, "ab")
+        # In append mode the OS writes at EOF regardless of the cursor, but
+        # tell() must reflect EOF too — seek there explicitly so it does.
+        self._file.seek(0, os.SEEK_END)
+
+    def tell(self) -> int:
+        """Current end of file = offset where the next record will start."""
+        return self._file.tell()
+
+    def append(self, record: bytes) -> int:
+        """Append one encoded record durably. Returns the offset it starts at."""
+        offset = self.tell()          # capture BEFORE writing — see §4.3
+        self._file.write(record)
+        self._file.flush()
+        os.fsync(self._file.fileno())
+        return offset
+
+    def close(self) -> None:
+        if not self._file.closed:
+            self._file.close()
