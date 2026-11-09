@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
             result = db.compact()
             print(json.dumps(result))
 
-    return 1
+    return 0
 
 
 if __name__ == "__main__":

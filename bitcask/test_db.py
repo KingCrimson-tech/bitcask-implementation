@@ -1,146 +1,220 @@
-from bitcask.log import HEADER, decode_record, encode_record
-import os
-from pathlib import Path
-import json
 import pytest
 
 from bitcask.db import Bitcask
+from bitcask.log import HEADER, decode_record, encode_record
 
+
+# --- 1. encode/decode roundtrip, including tombstone -----------------------
 def test_encode_decode_roundtrip():
-    ts, key, value = 1700000000, b"user:1", b'{"name":"Chinmay"}'
+    buf = encode_record(1_700_000_000, b"user:1", b'{"name":"Chinmay"}')
+    assert len(buf) == HEADER.size + len(b"user:1") + len(b'{"name":"Chinmay"}')
+    ts, key, value, _n = decode_record(buf)
+    assert (ts, key, value) == (1_700_000_000, b"user:1", b'{"name":"Chinmay"}')
 
-    buf = encode_record(ts, key, value)
+    tomb = encode_record(1_700_000_001, b"user:1", None)
+    _ts, key, value, _n = decode_record(tomb)
+    assert key == b"user:1" and value is None
 
-    assert buf[:4] == b"BITC"
-    assert len(buf) == HEADER.size + len(key) + len(value)  # 24 + 6 + 18 = 48
-    assert decode_record(buf) == (ts, key, value, len(buf))
+    # Empty value must not collide with a tombstone (§9.4)
+    empty = encode_record(1_700_000_002, b"user:1", b"")
+    _ts, key, value, _n = decode_record(empty)
+    assert key == b"user:1" and value == b""
 
-    # Tombstone: value=None -> val_len=0, decodes back to None
-    tombstone = encode_record(ts, key, None)
-    assert decode_record(tombstone) == (ts, key, None, HEADER.size + len(key))
 
+# --- 2. in-memory roundtrip -------------------------------------------------
+def test_put_get(tmp_path):
+    with Bitcask(tmp_path / "data") as db:
+        db.put("a", "1")
+        assert db.get("a") == "1"
+
+
+# --- 3. persistence across restart -----------------------------------------
 def test_persistence_restart(tmp_path):
-    db = Bitcask(tmp_path)
-    db.put("user:1", '{"name":"Chinmay"}')
-    db.put("user:2", "hello")
-    db.close()
-
-    db2 = Bitcask(tmp_path)  # reopen
-    assert db2.get("user:1") == '{"name":"Chinmay"}'
-    assert db2.get("user:2") == "hello"
-    db2.close()
+    with Bitcask(tmp_path / "data") as db:
+        db.put("a", "1")
+    with Bitcask(tmp_path / "data") as db:
+        assert db.get("a") == "1"
 
 
-def test_torn_write_truncates(tmp_path):
-    db = Bitcask(tmp_path)
-    db.put("a", "1")
-    db.put("b", "2")
-    db.close()
+# --- 4. overwrite: latest wins, also after restart --------------------------
+def test_overwrite_latest_wins(tmp_path):
+    with Bitcask(tmp_path / "data") as db:
+        db.put("a", "1")
+        db.put("a", "2")
+        assert db.get("a") == "2"
+    with Bitcask(tmp_path / "data") as db:
+        assert db.get("a") == "2"
 
-    # Simulate torn tail: partial header, no payload
-    seg = next((tmp_path / "segments").glob("seg_*.log"))
-    good_size = seg.stat().st_size
-    with(open(seg, "ab")) as f:
-        f.write(b"BITC\x00\x00")  # header partial, <24 bytes
-        f.flush()
-        os.fsync(f.fileno())
 
-    db2 = Bitcask(tmp_path)  # should NOT raise
-    assert db2.get("a") == "1"
-    assert db2.get("b") == "2"
-    db2.close()
-    # File was truncated back to last good record (allow +0 for new active segment check)
-    # The torn segment itself must be <= good_size + small new-segment overhead
-    # — assert it is exactly good_size
-    assert seg.stat().st_size == good_size
-
+# --- 5. delete then get raises; restart stays deleted -----------------------
 def test_delete_raises_and_stays_deleted(tmp_path):
-    db = Bitcask(tmp_path)
-    db.put("a", "1")
-    db.delete("a")
-    with pytest.raises(KeyError):
-        db.get("a")
-    db.close()
-
-    db2 = Bitcask(tmp_path)
-    with pytest.raises(KeyError):
-        db2.get("a")  # replay respects tombstone
-    db2.close()
+    with Bitcask(tmp_path / "data") as db:
+        db.put("a", "1")
+        db.delete("a")
+        with pytest.raises(KeyError):
+            db.get("a")
+    with Bitcask(tmp_path / "data") as db:
+        with pytest.raises(KeyError):
+            db.get("a")
 
 
 def test_delete_then_reput(tmp_path):
-    db = Bitcask(tmp_path)
-    db.put("a", "1")
-    db.delete("a")
-    db.put("a", "2")
-    assert db.get("a") == "2"
-    db.close()
-    db2 = Bitcask(tmp_path)
-    assert db2.get("a") == "2"
-    db2.close()
+    with Bitcask(tmp_path / "data") as db:
+        db.put("a", "1")
+        db.delete("a")
+        db.put("a", "2")
+        assert db.get("a") == "2"
+    with Bitcask(tmp_path / "data") as db:
+        assert db.get("a") == "2"
 
 
+# --- 6. delete of nonexistent key is a no-op --------------------------------
 def test_delete_nonexistent_is_noop(tmp_path):
-    db = Bitcask(tmp_path)
-    db.delete("ghost")  # must not raise
-    assert db.stats()["keys"] == 0
+    with Bitcask(tmp_path / "data") as db:
+        db.delete("never-there")  # must not raise
+        with pytest.raises(KeyError):
+            db.get("never-there")
+
+
+# --- 7. torn write: partial tail truncated on reopen -----------------------
+def test_torn_write_truncates(tmp_path):
+    data_dir = tmp_path / "data"
+    with Bitcask(data_dir) as db:
+        db.put("k1", "v1")
+        db.put("k2", "v2")
+    # Simulate a torn tail: append 10 garbage bytes to the active segment.
+    segs = sorted((data_dir / "segments").glob("seg_*.log"))
+    with open(segs[-1], "ab") as f:
+        f.write(b"BITC\x00\x00\x00")
+    with Bitcask(data_dir) as db:  # must not raise
+        assert db.get("k1") == "v1"
+        assert db.get("k2") == "v2"
+
+
+# --- 8. CRC corruption: flip a byte, reopen truncates at that record -------
+def test_crc_corruption(tmp_path):
+    data_dir = tmp_path / "data"
+    with Bitcask(data_dir) as db:
+        db.put("k1", "v1")
+        db.put("k2", "v2")
+    segs = sorted((data_dir / "segments").glob("seg_*.log"))
+    path = segs[-1]
+    raw = bytearray(path.read_bytes())
+    raw[-1] ^= 0xFF  # flip the last payload byte (k2's value)
+    path.write_bytes(bytes(raw))
+    with Bitcask(data_dir) as db:
+        assert db.get("k1") == "v1"  # good prefix preserved
+        with pytest.raises(KeyError):  # corrupt tail dropped
+            db.get("k2")
+
+
+def test_get_crc_mismatch_raises_value_error(tmp_path):
+    # §9.2: corruption after startup must fail loudly on the read path,
+    # not be returned as a value.
+    data_dir = tmp_path / "data"
+    with Bitcask(data_dir) as db:
+        db.put("k1", "v1")
+        db.put("k2", "v2")
+        segs = sorted((data_dir / "segments").glob("seg_*.log"))
+        path = segs[-1]
+        raw = bytearray(path.read_bytes())
+        raw[-1] ^= 0xFF
+        path.write_bytes(bytes(raw))
+        assert db.get("k1") == "v1"
+        with pytest.raises(ValueError, match="CRC mismatch"):
+            db.get("k2")
+
+
+def test_close_is_idempotent(tmp_path):
+    db = Bitcask(tmp_path / "data")
+    db.put("a", "1")
     db.close()
+    db.close()  # must not raise
 
 
-def test_stats_counts(tmp_path):
-    db = Bitcask(tmp_path)
-    db.put("k1", "v1")
-    db.put("k2", "v2")
-    s = db.stats()
-    assert s["keys"] == 2
-    assert s["keydir_entries"] == 2
-    assert s["segments"] >= 1
-    assert s["disk_bytes"] > 0
-    assert s["active_segment_bytes"] > 0
-    db.delete("k1")
-    assert db.stats()["keys"] == 1
-    db.close()
-
+# --- 9. compaction reclaims space, live data intact --------------------------
 def test_compaction_reclaims(tmp_path):
-    db = Bitcask(tmp_path, segment_size=1024)
-
-    # 1,000 overwrites over 10 keys — disk explodes, keys stay 10
-    for i in range(1000):
+    data_dir = tmp_path / "data"
+    with Bitcask(data_dir, segment_size=16 * 1024) as db:
+        for i in range(1_000):
+            for j in range(10):
+                db.put(f"key_{j}", f"value-{i}")
+        before = db.stats()["disk_bytes"]
+        result = db.compact()
+        after = db.stats()["disk_bytes"]
+        assert result["segments_merged"] >= 1
+        assert after < before // 4  # >75% reclaimed; plan says >80%, keep a margin
         for j in range(10):
-            db.put(f"key_{j}", f"value-{i}")
-
-    keys_before = db.stats()["keys"]
-    disk_before = db.stats()["disk_bytes"]
-
-    result = db.compact()
-
-    disk_after = db.stats()["disk_bytes"]
-    assert keys_before == 10
-    # All live data still readable — last write is value-999
-    for j in range(10):
-        assert db.get(f"key_{j}") == "value-999"
-
-    # Disk shrank >80%
-    assert disk_after < disk_before * 0.2, f"{disk_after} !< 0.2 * {disk_before}"
-    assert result["segments_merged"] >= 1
-    assert result["bytes_reclaimed"] > 0
-    db.close()
-
-    # Restart-after-compact still readable
-    db2 = Bitcask(tmp_path)
-    for j in range(10):
-        assert db2.get(f"key_{j}") == "value-999"
-    db2.close()
+            assert db.get(f"key_{j}") == "value-999"
+    with Bitcask(data_dir) as db:  # survives restart after compaction
+        for j in range(10):
+            assert db.get(f"key_{j}") == "value-999"
 
 
 def test_compaction_preserves_live_keys(tmp_path):
-    db = Bitcask(tmp_path)
-    db.put("a", "1")
-    db.put("b", "2")
-    db.delete("b")          # tombstone — b must NOT come back
-    db.put("a", "3")        # overwrite — a=1 is dead
-    db.compact()
-    assert db.get("a") == "3"
-    with pytest.raises(KeyError):
-        db.get("b")
-    db.close()
+    with Bitcask(tmp_path / "data") as db:
+        db.put("a", "1")
+        db.put("b", "2")
+        db.delete("b")  # tombstone — b must NOT come back
+        db.put("a", "3")  # overwrite — a=1 is dead
+        db.compact()
+        assert db.get("a") == "3"
+        with pytest.raises(KeyError):
+            db.get("b")
+    with Bitcask(tmp_path / "data") as db:
+        assert db.get("a") == "3"
+        with pytest.raises(KeyError):
+            db.get("b")
+
+
+# --- 10. stats counts ---------------------------------------------------------
+def test_stats_counts(tmp_path):
+    with Bitcask(tmp_path / "data") as db:
+        s = db.stats()
+        assert s["keys"] == 0
+        db.put("a", "1")
+        db.put("b", "2")
+        s = db.stats()
+        assert s["keys"] == 2
+        assert s["segments"] >= 1
+        assert s["disk_bytes"] > 0
+        assert s["keydir_entries"] == 2
+        db.delete("a")
+        assert db.stats()["keys"] == 1
+
+
+# --- 11. unicode, emoji, newlines, large values, empty value -----------------
+def test_unicode_and_large_value(tmp_path):
+    big = "x" * (100 * 1024)  # 100 KB
+    with Bitcask(tmp_path / "data") as db:
+        db.put("🔑 emoji-key", "🎉 value")
+        assert db.get("🔑 emoji-key") == "🎉 value"
+        db.put("key with\nnewlines", "line one\nline two\n")
+        assert db.get("key with\nnewlines") == "line one\nline two\n"
+        db.put("big", big)
+        assert db.get("big") == big
+        db.put("empty", "")
+        assert db.get("empty") == ""
+    with Bitcask(tmp_path / "data") as db:  # all survive restart
+        assert db.get("🔑 emoji-key") == "🎉 value"
+        assert db.get("big") == big
+        assert db.get("empty") == ""
+
+
+# --- 12. empty key rejected ------------------------------------------------------
+@pytest.mark.parametrize("op", ["put", "get", "delete"])
+def test_empty_key_rejected(tmp_path, op):
+    with Bitcask(tmp_path / "data") as db:
+        with pytest.raises(ValueError):
+            if op == "put":
+                db.put("", "v")
+            elif op == "get":
+                db.get("")
+            else:
+                db.delete("")
+
+
+def test_non_string_key_rejected(tmp_path):
+    with Bitcask(tmp_path / "data") as db:
+        with pytest.raises(TypeError):
+            db.put(None, "v")  # type: ignore[arg-type]

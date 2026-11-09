@@ -8,11 +8,23 @@ MAGIC = b"BITC"
 HEADER = struct.Struct(">4sQIII")             # 24 bytes: magic, ts, key_len, val_len, crc
 HEADER_WITHOUT_CRC = struct.Struct(">4sQII")  # 20 bytes: magic, ts, key_len, val_len
 
+# Tombstones and empty values both have zero payload bytes, so they need a
+# way to be told apart on disk (§9.4). The high bit of val_len is a tombstone
+# flag: a tombstone stores val_len == TOMBSTONE_FLAG (real length 0), while an
+# empty value stores val_len == 0. Real lengths stay below 2**31, so the flag
+# never collides with a genuine length. Record size (header+key+value) is
+# unchanged in both cases.
+TOMBSTONE_FLAG = 0x80000000
+
 
 def encode_record(ts: int, key: bytes, value: bytes | None) -> bytes:
-    """Encode one record. value=None encodes a tombstone (val_len=0)."""
-    value_bytes = b"" if value is None else value
-    val_len = 0 if value is None else len(value_bytes)
+    """Encode one record. value=None encodes a tombstone (flagged val_len)."""
+    if value is None:
+        value_bytes = b""
+        val_len = TOMBSTONE_FLAG
+    else:
+        value_bytes = value
+        val_len = len(value_bytes)
 
     header_without_crc = HEADER_WITHOUT_CRC.pack(MAGIC, ts, len(key), val_len)
     crc = zlib.crc32(header_without_crc + key + value_bytes) & 0xFFFFFFFF
@@ -38,7 +50,9 @@ def decode_record(buf: bytes) -> tuple[int, bytes, bytes | None, int]:
     if magic != MAGIC:
         raise ValueError(f"bad magic: {magic!r}")
 
-    record_len = HEADER.size + key_len + val_len
+    is_tombstone = bool(val_len & TOMBSTONE_FLAG)
+    real_val_len = val_len & ~TOMBSTONE_FLAG
+    record_len = HEADER.size + key_len + real_val_len
     if len(buf) < record_len:
         raise ValueError("truncated record")
 
@@ -49,7 +63,7 @@ def decode_record(buf: bytes) -> tuple[int, bytes, bytes | None, int]:
     if crc != stored_crc:
         raise ValueError("CRC mismatch")
 
-    value = None if val_len == 0 else value_bytes
+    value = None if is_tombstone else value_bytes
     return ts, key, value, record_len
 
 class SegmentWriter:
@@ -80,7 +94,9 @@ class SegmentWriter:
         return offset
 
     def close(self) -> None:
-        if not self._file.closed:
+        """Flush and close. Idempotent — safe to call twice (§9.3)."""
+        if self._file is not None and not self._file.closed:
+            self._file.flush()
             self._file.close()
 
 def iter_records(path: Path):
@@ -100,11 +116,15 @@ def iter_records(path: Path):
                 magic, ts, key_len, val_len, crc = HEADER.unpack(header)
                 if magic != MAGIC:
                     return
-                payload = f.read(key_len + val_len)
-                if len(payload) < key_len + val_len:
+                is_tombstone = bool(val_len & TOMBSTONE_FLAG)
+                real_val_len = val_len & ~TOMBSTONE_FLAG
+                payload = f.read(key_len + real_val_len)
+                if len(payload) < key_len + real_val_len:
                     return  # torn payload
                 key = payload[:key_len]
-                value = payload[key_len:key_len + val_len] if val_len else None
+                value = (
+                    None if is_tombstone else payload[key_len:key_len + real_val_len]
+                )
                 header_without_crc = HEADER_WITHOUT_CRC.pack(
                     magic, ts, key_len, val_len
                 )
