@@ -1,6 +1,8 @@
 from bitcask.log import HEADER, decode_record, encode_record
 import os
 from pathlib import Path
+import json
+import pytest
 
 from bitcask.db import Bitcask
 
@@ -51,3 +53,50 @@ def test_torn_write_truncates(tmp_path):
     # The torn segment itself must be <= good_size + small new-segment overhead
     # — assert it is exactly good_size
     assert seg.stat().st_size == good_size
+
+def test_delete_raises_and_stays_deleted(tmp_path):
+    db = Bitcask(tmp_path)
+    db.put("a", "1")
+    db.delete("a")
+    with pytest.raises(KeyError):
+        db.get("a")
+    db.close()
+
+    db2 = Bitcask(tmp_path)
+    with pytest.raises(KeyError):
+        db2.get("a")  # replay respects tombstone
+    db2.close()
+
+
+def test_delete_then_reput(tmp_path):
+    db = Bitcask(tmp_path)
+    db.put("a", "1")
+    db.delete("a")
+    db.put("a", "2")
+    assert db.get("a") == "2"
+    db.close()
+    db2 = Bitcask(tmp_path)
+    assert db2.get("a") == "2"
+    db2.close()
+
+
+def test_delete_nonexistent_is_noop(tmp_path):
+    db = Bitcask(tmp_path)
+    db.delete("ghost")  # must not raise
+    assert db.stats()["keys"] == 0
+    db.close()
+
+
+def test_stats_counts(tmp_path):
+    db = Bitcask(tmp_path)
+    db.put("k1", "v1")
+    db.put("k2", "v2")
+    s = db.stats()
+    assert s["keys"] == 2
+    assert s["keydir_entries"] == 2
+    assert s["segments"] >= 1
+    assert s["disk_bytes"] > 0
+    assert s["active_segment_bytes"] > 0
+    db.delete("k1")
+    assert db.stats()["keys"] == 1
+    db.close()

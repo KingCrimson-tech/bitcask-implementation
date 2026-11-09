@@ -39,12 +39,7 @@ class Bitcask:
 
             record = encode_record(ts, key_bytes, value_bytes)
 
-            # Rotate BEFORE writing if the record won't fit.
-            if (
-                self._active.tell() > 0
-                and self._active.tell() + len(record) > self.segment_size
-            ):
-                self._rotate()
+            self._maybe_rotate(len(record))
 
             offset = self._active.append(record)
             self._keydir[key] = (
@@ -125,6 +120,41 @@ class Bitcask:
                         )
                 except FileNotFoundError:
                     pass
+
+    def _maybe_rotate(self, record_size: int) -> None:
+        if (
+            self._active.tell() > 0
+            and self._active.tell() + record_size > self.segment_size
+        ):
+            self._rotate()
+    
+    def delete(self, key: str) -> None:
+        if not key:
+            raise ValueError("empty key")
+        with self._lock:
+            # Always append tombstone so replay stays deleted (see §7.1)
+            ts = int(time.time())
+            record = encode_record(ts, key.encode("utf-8"), None)
+            self._maybe_rotate(len(record))
+            self._active.append(record)   # flush + fsync inside SegmentWriter
+            self._keydir.pop(key, None)
+    
+    def stats(self) -> dict:
+        with self._lock:
+            keys = len(self._keydir)
+            segments = len(self._segments)
+            disk_bytes = sum(p.stat().st_size for p in self._segments.values() if p.exists())
+            return {
+                "keys": keys,
+                "keydir_entries": keys,  # kept for plan compatibility
+                "segments": segments,
+                "disk_bytes": disk_bytes,
+                "active_segment_bytes": (
+                    self._active.tell() if self._active else 0
+                ),
+                "active_segment_id": self._active_id,
+                "data_dir": str(self.data_dir),
+            }
 
 def _seg_id_of(path: Path) -> int:
     # seg_000001.log -> 1

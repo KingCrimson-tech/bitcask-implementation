@@ -1,5 +1,6 @@
 import argparse
 import sys
+import json
 
 from bitcask.db import Bitcask
 
@@ -24,6 +25,11 @@ def main(argv: list[str] | None = None) -> int:
     get = sub.add_parser("get", help="print the value for a key")
     get.add_argument("key")
 
+    p_delete = sub.add_parser("delete", help="Delete a key (appends tombstone).")
+    p_delete.add_argument("key")
+    
+    p_stats = sub.add_parser("stats", help="Show store statistics as JSON.")
+
     args = parser.parse_args(argv)
 
     with Bitcask(args.dir) as db:
@@ -38,6 +44,12 @@ def main(argv: list[str] | None = None) -> int:
                 print("KeyError: not found", file=sys.stderr)
                 return 1
             return 0
+
+        elif args.command == "delete":
+            db.delete(args.key)
+
+        elif args.command == "stats":
+            print(json.dumps(db.stats()))
 
     return 1
 
