@@ -2,7 +2,7 @@ import threading
 import time
 from pathlib import Path
 
-from bitcask.log import SegmentWriter, encode_record
+from bitcask.log import SegmentWriter, encode_record, decode_record, HEADER, MAGIC
 
 
 class Bitcask:
@@ -35,6 +35,33 @@ class Bitcask:
             # Rotate AFTER the write that crossed the limit.
             if self._active.tell() > self._segment_size:
                 self._rotate()
+
+    def get(self, key: str) -> str:
+        with self._lock:
+            if key not in self._keydir:
+                raise KeyError(key)
+
+            seg_id, offset, value_size, ts = self._keydir[key]
+
+            with open(self._segments[seg_id], "rb") as f:
+                f.seek(offset)
+                header = f.read(HEADER.size)
+                if len(header) < HEADER.size:
+                    raise ValueError(f"corrupt record at seg {seg_id} offset {offset}")
+
+                magic, rts, key_len, val_len, crc = HEADER.unpack(header)
+                if magic != MAGIC:
+                    raise ValueError(f"bad magic at seg {seg_id} offset {offset}")
+
+                payload = f.read(key_len + val_len)
+
+            # Reassemble the full record and let decode_record verify the CRC.
+            _, found_key, value, _ = decode_record(header + payload)
+
+            if value is None:  # tombstone — deleted keys read as missing
+                raise KeyError(key)
+
+            return value.decode("utf-8")
 
     def _rotate(self) -> None:
         self._active.close()
