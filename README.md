@@ -91,3 +91,8 @@ benchmark.py   README.md
 python -m pytest -q       # 19 tests, all passing
 ruff check bitcask/
 ```
+
+## Future Work
+
+- Concurrency concerns
+- Efficiency Improvement
